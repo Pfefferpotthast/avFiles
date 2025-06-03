@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 from torch.utils.tensorboard import SummaryWriter
+from collections import deque  # --- MODIFIED ---
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -16,12 +17,12 @@ class DiscretizedCarRacing(gym.ActionWrapper):
     def __init__(self, env):
         super().__init__(env)
         self.actions = [
-            np.array([0.0, 1.0, 0.0]),    # straight
-            np.array([-1.0, 1.0, 0.0]),   # left turn
-            np.array([1.0, 1.0, 0.0]),    # right turn
-            np.array([0.0, 0.0, 0.8]),    # brake
-            np.array([-0.5, 1.0, 0.0]),   # slight left
-            np.array([0.5, 1.0, 0.0]),    # slight right
+            np.array([0.0, 1.0, 0.0]),
+            np.array([-1.0, 1.0, 0.0]),
+            np.array([1.0, 1.0, 0.0]),
+            np.array([0.0, 0.0, 0.8]),
+            np.array([-0.5, 1.0, 0.0]),
+            np.array([0.5, 1.0, 0.0]),
         ]
         self.action_space = gym.spaces.Discrete(len(self.actions))
 
@@ -124,11 +125,17 @@ class PPO:
         self.entropy_coef = kwargs.get('entropy_coef', 0.01)
         self.max_grad_norm = kwargs.get('max_grad_norm', 0.5)
 
+        self.episode_counter = 0  # --- MODIFIED ---
+        self.reward_history = deque(maxlen=100)  # --- MODIFIED ---
+        self.prev_avg_reward = 0  # --- MODIFIED ---
+
     def collect_rollouts(self):
         steps = 0
-        episode_reward = 0
         state, _ = self.env.reset()
         done = False
+        episode_rewards = []
+        episode_reward = 0
+        episode_count = 0
 
         while steps < self.n_steps:
             state_tensor = preprocess_state(state).unsqueeze(0)
@@ -149,6 +156,9 @@ class PPO:
             episode_reward += reward
 
             if done:
+                episode_rewards.append(episode_reward)
+                episode_reward = 0
+                episode_count += 1
                 state, _ = self.env.reset()
 
         with torch.no_grad():
@@ -157,7 +167,8 @@ class PPO:
             last_value = last_value.item() if not done else 0
 
         returns, advantages = self.rollout_buffer.compute_returns_and_advantages(last_value)
-        return returns, advantages, episode_reward
+        avg_episode_reward = np.mean(episode_rewards) if episode_rewards else 0
+        return returns, advantages, avg_episode_reward, episode_count  # --- MODIFIED ---
 
     def update_policy(self, returns, advantages):
         states, actions, old_log_probs, returns, advantages = self.rollout_buffer.get_tensors(returns, advantages)
@@ -195,17 +206,26 @@ class PPO:
 
     def learn(self):
         iteration = 0
-        while True:
-            returns, advantages, reward = self.collect_rollouts()
+        while self.episode_counter < 1000:  # --- MODIFIED ---
+            returns, advantages, avg_ep_reward, num_eps = self.collect_rollouts()
             p_loss, v_loss, ent = self.update_policy(returns, advantages)
+
+            self.episode_counter += num_eps
+            self.reward_history.append(avg_ep_reward)
+            avg_reward = np.mean(self.reward_history)
+            reward_increase = avg_reward - self.prev_avg_reward
+            self.prev_avg_reward = avg_reward
+
             iteration += 1
 
-            self.writer.add_scalar("loss/policy", p_loss, iteration)
-            self.writer.add_scalar("loss/value", v_loss, iteration)
-            self.writer.add_scalar("loss/entropy", ent, iteration)
-            self.writer.add_scalar("charts/reward", reward, iteration)
+            self.writer.add_scalar("loss/policy", p_loss, self.episode_counter)
+            self.writer.add_scalar("loss/value", v_loss, self.episode_counter)
+            self.writer.add_scalar("loss/entropy", ent, self.episode_counter)
+            self.writer.add_scalar("charts/avg_episode_reward", avg_ep_reward, self.episode_counter)
+            self.writer.add_scalar("charts/avg_100ep_reward", avg_reward, self.episode_counter)
+            self.writer.add_scalar("charts/reward_increase", reward_increase, self.episode_counter)
 
-            print(f"Iter {iteration} | Reward: {reward:.2f}")
+            print(f"Ep {self.episode_counter} | AvgReward (this rollout): {avg_ep_reward:.2f} | Trend: {reward_increase:+.2f}")
             print(f"Losses => Policy: {p_loss:.4f}, Value: {v_loss:.4f}, Entropy: {ent:.4f}")
             print("-" * 50)
 
