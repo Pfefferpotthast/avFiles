@@ -153,6 +153,17 @@ class PPO:
         self.entropy_coef = kwargs.get('entropy_coef', 0.02)
         self.max_grad_norm = kwargs.get('max_grad_norm', 0.5)
 
+        self.episode_counter = 0
+        self.reward_history = deque(maxlen=100)
+        self.prev_avg_reward = 0
+        self.entropy_history = deque(maxlen=100)  # ⬅️ This line is essential
+
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            lr_lambda=lambda step: max(0.1, 1 - step / 1000.0)
+        )
+
+
         self.episode_counter = 0  # --- MODIFIED ---
         self.reward_history = deque(maxlen=100)  # --- MODIFIED ---
         self.prev_avg_reward = 0  # --- MODIFIED ---
