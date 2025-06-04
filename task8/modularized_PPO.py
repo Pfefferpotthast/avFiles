@@ -191,7 +191,7 @@ class PPO:
 
             next_state, reward, terminated, truncated, _ = self.env.step(action.item())
             done = terminated or truncated
-            reward /= 100.0  # scale reward for smoother gradients
+            reward = np.clip(reward, -1, 1)
 
             self.rollout_buffer.add(state_tensor.squeeze(0), action.item(), reward, done, value.squeeze(), log_prob)
 
