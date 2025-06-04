@@ -29,6 +29,34 @@ class DiscretizedCarRacing(gym.ActionWrapper):
     def action(self, action_idx):
         return self.actions[action_idx]
 
+class FrameStackWrapper(gym.Wrapper):
+    def __init__(self, env, k=4):
+        super().__init__(env)
+        self.k = k
+        self.frames = deque([], maxlen=k)
+
+    def reset(self):
+        obs, info = self.env.reset()
+        preprocessed = preprocess_single_frame(obs)
+        for _ in range(self.k):
+            self.frames.append(preprocessed)
+        return self._get_obs(), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        preprocessed = preprocess_single_frame(obs)
+        self.frames.append(preprocessed)
+        return self._get_obs(), reward, terminated, truncated, info
+
+    def _get_obs(self):
+        return np.stack(self.frames, axis=0)  # shape: (k, 64, 64)
+
+def preprocess_single_frame(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)     # Convert to grayscale
+    resized = cv2.resize(gray, (64, 64))                # Resize to 64x64
+    normalized = resized / 255.0                        # Normalize pixel values to [0, 1]
+    return normalized.astype(np.float32)                # Ensure float32 type for PyTorch
+
 def preprocess_state(state):
     state = cv2.cvtColor(state, cv2.COLOR_RGB2GRAY)
     state = cv2.resize(state, (64, 64))
@@ -122,12 +150,17 @@ class PPO:
         self.gae_lambda = kwargs.get('gae_lambda', 0.95)
         self.clip_range = kwargs.get('clip_range', 0.2)
         self.value_coef = kwargs.get('value_coef', 0.5)
-        self.entropy_coef = kwargs.get('entropy_coef', 0.01)
+        self.entropy_coef = kwargs.get('entropy_coef', 0.02)
         self.max_grad_norm = kwargs.get('max_grad_norm', 0.5)
 
         self.episode_counter = 0  # --- MODIFIED ---
         self.reward_history = deque(maxlen=100)  # --- MODIFIED ---
         self.prev_avg_reward = 0  # --- MODIFIED ---
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            lr_lambda=lambda step: max(0.1, 1 - step / 1000.0)  # decay to 10% over time
+        )
+
 
     def collect_rollouts(self):
         steps = 0
@@ -147,7 +180,7 @@ class PPO:
 
             next_state, reward, terminated, truncated, _ = self.env.step(action.item())
             done = terminated or truncated
-            reward = np.clip(reward, -1, 1)
+            reward /= 100.0  # scale reward for smoother gradients
 
             self.rollout_buffer.add(state_tensor.squeeze(0), action.item(), reward, done, value.squeeze(), log_prob)
 
@@ -225,14 +258,26 @@ class PPO:
             self.writer.add_scalar("charts/avg_100ep_reward", avg_reward, self.episode_counter)
             self.writer.add_scalar("charts/reward_increase", reward_increase, self.episode_counter)
 
+            # New: log entropy moving average
+            self.entropy_history.append(ent)
+            avg_entropy = np.mean(self.entropy_history)
+            self.writer.add_scalar("charts/avg_entropy", avg_entropy, self.episode_counter)
+
+
             print(f"Ep {self.episode_counter} | AvgReward (this rollout): {avg_ep_reward:.2f} | Trend: {reward_increase:+.2f}")
             print(f"Losses => Policy: {p_loss:.4f}, Value: {v_loss:.4f}, Entropy: {ent:.4f}")
             print("-" * 50)
 
             self.writer.flush()
 
+            # Learning rate schedule step
+            self.scheduler.step()
+            current_lr = self.optimizer.param_groups[0]['lr']
+            self.writer.add_scalar("charts/learning_rate", current_lr, self.episode_counter)
+
             if iteration % 10 == 0:
                 torch.save(self.policy.state_dict(), f"ppo_model_iter{iteration}.pth")
+
 
 # --- Main ---
 if __name__ == "__main__":
