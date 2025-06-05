@@ -8,10 +8,81 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 from torch.utils.tensorboard import SummaryWriter
-from collections import deque  # --- MODIFIED ---
+from collections import deque
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
+
+
+def preprocess_single_frame(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    resized = cv2.resize(gray, (64, 64))
+    normalized = resized / 255.0
+    return normalized.astype(np.float32)
+
+
+def preprocess_state(state_stack):
+    return torch.tensor(state_stack, dtype=torch.float32, device=device)
+
+
+def reward_memory():
+    count = 0
+    length = 100
+    history = np.zeros(length)
+
+    def memory(reward):
+        nonlocal count
+        history[count] = reward
+        count = (count + 1) % length
+        return np.mean(history)
+
+    return memory
+
+
+def compute_shaped_reward(rgb_obs, base_reward, terminated, av_r_fn=None, enable_early_termination=True):
+    reward = base_reward
+
+    if terminated:
+        reward += 100.0
+
+    if np.mean(rgb_obs[:, :, 1]) > 185.0:
+        reward -= 0.05
+
+    early_done = False
+    if enable_early_termination and av_r_fn is not None:
+        early_done = av_r_fn(reward) <= -0.1
+
+    return reward, early_done
+
+
+class FrameStackWrapper(gym.Wrapper):
+    def __init__(self, env, k=4):
+        super().__init__(env)
+        self.k = k
+        self.frames = deque([], maxlen=k)
+        self.last_rgb = None
+
+    def reset(self):
+        obs, info = self.env.reset()
+        self.last_rgb = obs
+        preprocessed = preprocess_single_frame(obs)
+        for _ in range(self.k):
+            self.frames.append(preprocessed)
+        return self._get_obs(), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self.last_rgb = obs
+        preprocessed = preprocess_single_frame(obs)
+        self.frames.append(preprocessed)
+        return self._get_obs(), reward, terminated, truncated, info
+
+    def _get_obs(self):
+        return np.stack(self.frames, axis=0)
+
+    def get_latest_rgb(self):
+        return self.last_rgb
+
 
 class DiscretizedCarRacing(gym.ActionWrapper):
     def __init__(self, env):
@@ -29,46 +100,12 @@ class DiscretizedCarRacing(gym.ActionWrapper):
     def action(self, action_idx):
         return self.actions[action_idx]
 
-class FrameStackWrapper(gym.Wrapper):
-    def __init__(self, env, k=4):
-        super().__init__(env)
-        self.k = k
-        self.frames = deque([], maxlen=k)
-
-    def reset(self):
-        obs, info = self.env.reset()
-        preprocessed = preprocess_single_frame(obs)
-        for _ in range(self.k):
-            self.frames.append(preprocessed)
-        return self._get_obs(), info
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        preprocessed = preprocess_single_frame(obs)
-        self.frames.append(preprocessed)
-        return self._get_obs(), reward, terminated, truncated, info
-
-    def _get_obs(self):
-        return np.stack(self.frames, axis=0)  # shape: (k, 64, 64)
-
-def preprocess_single_frame(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)     # Convert to grayscale
-    resized = cv2.resize(gray, (64, 64))                # Resize to 64x64
-    normalized = resized / 255.0                        # Normalize pixel values to [0, 1]
-    return normalized.astype(np.float32)                # Ensure float32 type for PyTorch
-
-def preprocess_state(state):
-    state = cv2.cvtColor(state, cv2.COLOR_RGB2GRAY)
-    state = cv2.resize(state, (64, 64))
-    state = np.expand_dims(state, axis=0)
-    state = state / 255.0
-    return torch.tensor(state, dtype=torch.float32, device=device)
 
 class PPOPolicy(nn.Module):
     def __init__(self, action_dim):
         super().__init__()
         self.shared_cnn = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=8, stride=4),
+            nn.Conv2d(4, 32, kernel_size=8, stride=4),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2),
             nn.ReLU(),
@@ -76,7 +113,7 @@ class PPOPolicy(nn.Module):
             nn.ReLU(),
         )
         with torch.no_grad():
-            dummy = torch.zeros(1, 1, 64, 64)
+            dummy = torch.zeros(1, 4, 64, 64)
             dummy_out = self.shared_cnn(dummy)
             self.flattened_size = dummy_out.view(1, -1).shape[1]
 
@@ -92,6 +129,7 @@ class PPOPolicy(nn.Module):
         x = self.shared_cnn(x)
         x = self.shared_fc(x)
         return self.actor(x), self.critic(x)
+
 
 class RolloutBuffer:
     def __init__(self):
@@ -135,12 +173,17 @@ class RolloutBuffer:
         advantages = returns - values[:-1]
         return returns, advantages
 
+
 class PPO:
     def __init__(self, env, writer, **kwargs):
         self.env = env
         self.writer = writer
         self.policy = PPOPolicy(action_dim=env.action_space.n).to(device)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=kwargs.get('learning_rate', 3e-4))
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            lr_lambda=lambda step: max(0.1, 1 - step / 1000.0)
+        )
         self.rollout_buffer = RolloutBuffer()
 
         self.n_steps = kwargs.get('n_steps', 4096)
@@ -156,22 +199,10 @@ class PPO:
         self.episode_counter = 0
         self.reward_history = deque(maxlen=100)
         self.prev_avg_reward = 0
-        self.entropy_history = deque(maxlen=100)  # ⬅️ This line is essential
+        self.entropy_history = deque(maxlen=100)
 
-        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-            self.optimizer,
-            lr_lambda=lambda step: max(0.1, 1 - step / 1000.0)
-        )
-
-
-        self.episode_counter = 0  # --- MODIFIED ---
-        self.reward_history = deque(maxlen=100)  # --- MODIFIED ---
-        self.prev_avg_reward = 0  # --- MODIFIED ---
-        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-            self.optimizer,
-            lr_lambda=lambda step: max(0.1, 1 - step / 1000.0)  # decay to 10% over time
-        )
-
+        self.early_termination_enabled = kwargs.get("early_termination", True)
+        self.av_r = reward_memory() if self.early_termination_enabled else None
 
     def collect_rollouts(self):
         steps = 0
@@ -189,12 +220,25 @@ class PPO:
                 action = dist.sample()
                 log_prob = dist.log_prob(action)
 
-            next_state, reward, terminated, truncated, _ = self.env.step(action.item())
-            done = terminated or truncated
-            reward = np.clip(reward, -1, 1)
+            next_state, base_reward, terminated, truncated, _ = self.env.step(action.item())
+
+            if hasattr(self.env, "get_latest_rgb"):
+                rgb_frame = self.env.get_latest_rgb()
+            else:
+                raise RuntimeError("env must support get_latest_rgb() for reward shaping")
+
+            reward, early_done = compute_shaped_reward(
+                rgb_obs=rgb_frame,
+                base_reward=base_reward,
+                terminated=terminated,
+                av_r_fn=self.av_r,
+                enable_early_termination=self.early_termination_enabled
+            )
+
+            done = terminated or truncated or early_done
+            reward /= 100.0
 
             self.rollout_buffer.add(state_tensor.squeeze(0), action.item(), reward, done, value.squeeze(), log_prob)
-
             state = next_state
             steps += 1
             episode_reward += reward
@@ -212,7 +256,7 @@ class PPO:
 
         returns, advantages = self.rollout_buffer.compute_returns_and_advantages(last_value)
         avg_episode_reward = np.mean(episode_rewards) if episode_rewards else 0
-        return returns, advantages, avg_episode_reward, episode_count  # --- MODIFIED ---
+        return returns, advantages, avg_episode_reward, episode_count
 
     def update_policy(self, returns, advantages):
         states, actions, old_log_probs, returns, advantages = self.rollout_buffer.get_tensors(returns, advantages)
@@ -250,7 +294,7 @@ class PPO:
 
     def learn(self):
         iteration = 0
-        while self.episode_counter < 1000:  # --- MODIFIED ---
+        while self.episode_counter < 1000:
             returns, advantages, avg_ep_reward, num_eps = self.collect_rollouts()
             p_loss, v_loss, ent = self.update_policy(returns, advantages)
 
@@ -260,6 +304,9 @@ class PPO:
             reward_increase = avg_reward - self.prev_avg_reward
             self.prev_avg_reward = avg_reward
 
+            self.entropy_history.append(ent)
+            avg_entropy = np.mean(self.entropy_history)
+
             iteration += 1
 
             self.writer.add_scalar("loss/policy", p_loss, self.episode_counter)
@@ -268,20 +315,13 @@ class PPO:
             self.writer.add_scalar("charts/avg_episode_reward", avg_ep_reward, self.episode_counter)
             self.writer.add_scalar("charts/avg_100ep_reward", avg_reward, self.episode_counter)
             self.writer.add_scalar("charts/reward_increase", reward_increase, self.episode_counter)
-
-            # New: log entropy moving average
-            self.entropy_history.append(ent)
-            avg_entropy = np.mean(self.entropy_history)
             self.writer.add_scalar("charts/avg_entropy", avg_entropy, self.episode_counter)
-
 
             print(f"Ep {self.episode_counter} | AvgReward (this rollout): {avg_ep_reward:.2f} | Trend: {reward_increase:+.2f}")
             print(f"Losses => Policy: {p_loss:.4f}, Value: {v_loss:.4f}, Entropy: {ent:.4f}")
             print("-" * 50)
 
             self.writer.flush()
-
-            # Learning rate schedule step
             self.scheduler.step()
             current_lr = self.optimizer.param_groups[0]['lr']
             self.writer.add_scalar("charts/learning_rate", current_lr, self.episode_counter)
@@ -290,13 +330,13 @@ class PPO:
                 torch.save(self.policy.state_dict(), f"ppo_model_iter{iteration}.pth")
 
 
-# --- Main ---
 if __name__ == "__main__":
     run_name = f"PPO_CarRacing_{int(time.time())}"
     writer = SummaryWriter(f"runs/{run_name}")
 
-    env = gym.make("CarRacing-v3", render_mode="rgb_array", continuous=True)
-    env = DiscretizedCarRacing(env)
+    base_env = gym.make("CarRacing-v3", render_mode="rgb_array", continuous=True)
+    discrete_env = DiscretizedCarRacing(base_env)
+    env = FrameStackWrapper(discrete_env, k=4)
 
-    agent = PPO(env, writer, n_steps=4096, batch_size=64, n_epochs=10)
+    agent = PPO(env, writer, n_steps=4096, batch_size=64, n_epochs=10, early_termination=True)
     agent.learn()
