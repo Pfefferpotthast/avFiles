@@ -46,11 +46,11 @@ def compute_shaped_reward(rgb_obs, base_reward, terminated, av_r_fn=None, enable
         reward += 100.0
 
     if np.mean(rgb_obs[:, :, 1]) > 185.0:
-        reward -= 0.05
+        reward -= 0.01 
 
     early_done = False
     if enable_early_termination and av_r_fn is not None:
-        early_done = av_r_fn(reward) <= -0.1
+        early_done = av_r_fn(reward) <= -1.0 
 
     return reward, early_done
 
@@ -88,12 +88,12 @@ class DiscretizedCarRacing(gym.ActionWrapper):
     def __init__(self, env):
         super().__init__(env)
         self.actions = [
-            np.array([0.0, 1.0, 0.0]),
-            np.array([-1.0, 1.0, 0.0]),
-            np.array([1.0, 1.0, 0.0]),
-            np.array([0.0, 0.0, 0.8]),
-            np.array([-0.5, 1.0, 0.0]),
-            np.array([0.5, 1.0, 0.0]),
+            np.array([0.0, 1.0, 0.0]),      # Forward
+            np.array([-1.0, 1.0, 0.0]),    # Left + Forward
+            np.array([1.0, 1.0, 0.0]),     # Right + Forward
+            np.array([0.0, 0.0, 0.8]),     # Brake
+            np.array([-0.5, 1.0, 0.0]),    # Slight Left + Forward
+            np.array([0.5, 1.0, 0.0]),     # Slight Right + Forward
         ]
         self.action_space = gym.spaces.Discrete(len(self.actions))
 
@@ -112,6 +112,7 @@ class PPOPolicy(nn.Module):
             nn.Conv2d(64, 64, kernel_size=3, stride=1),
             nn.ReLU(),
         )
+        
         with torch.no_grad():
             dummy = torch.zeros(1, 4, 64, 64)
             dummy_out = self.shared_cnn(dummy)
@@ -179,21 +180,17 @@ class PPO:
         self.env = env
         self.writer = writer
         self.policy = PPOPolicy(action_dim=env.action_space.n).to(device)
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=kwargs.get('learning_rate', 3e-4))
-        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-            self.optimizer,
-            lr_lambda=lambda step: max(0.1, 1 - step / 1000.0)
-        )
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=kwargs.get('learning_rate', 2.5e-4))  
         self.rollout_buffer = RolloutBuffer()
 
-        self.n_steps = kwargs.get('n_steps', 4096)
+        self.n_steps = kwargs.get('n_steps', 2048) 
         self.batch_size = kwargs.get('batch_size', 64)
-        self.n_epochs = kwargs.get('n_epochs', 10)
+        self.n_epochs = kwargs.get('n_epochs', 4)
         self.gamma = kwargs.get('gamma', 0.99)
         self.gae_lambda = kwargs.get('gae_lambda', 0.95)
         self.clip_range = kwargs.get('clip_range', 0.2)
         self.value_coef = kwargs.get('value_coef', 0.5)
-        self.entropy_coef = kwargs.get('entropy_coef', 0.02)
+        self.entropy_coef = kwargs.get('entropy_coef', 0.01) 
         self.max_grad_norm = kwargs.get('max_grad_norm', 0.5)
 
         self.episode_counter = 0
@@ -236,7 +233,9 @@ class PPO:
             )
 
             done = terminated or truncated or early_done
-            reward /= 100.0
+            
+
+            reward = np.clip(reward / 50.0, -1.0, 1.0) 
 
             self.rollout_buffer.add(state_tensor.squeeze(0), action.item(), reward, done, value.squeeze(), log_prob)
             state = next_state
@@ -260,15 +259,16 @@ class PPO:
 
     def update_policy(self, returns, advantages):
         states, actions, old_log_probs, returns, advantages = self.rollout_buffer.get_tensors(returns, advantages)
+        
         std = advantages.std()
-        if std < 1e-8:
-            std = 1e-8
-        advantages = (advantages - advantages.mean()) / std
+        advantages = (advantages - advantages.mean()) / (std + 1e-8)
 
         dataset = torch.utils.data.TensorDataset(states, actions, old_log_probs, returns, advantages)
         dataloader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
-        for _ in range(self.n_epochs):
+        policy_losses, value_losses, entropies = [], [], []
+
+        for epoch in range(self.n_epochs):
             for batch in dataloader:
                 batch_states, batch_actions, batch_old_log_probs, batch_returns, batch_advantages = batch
                 logits, values = self.policy(batch_states)
@@ -276,6 +276,10 @@ class PPO:
                 new_log_probs = dist.log_prob(batch_actions)
 
                 ratio = torch.exp(new_log_probs - batch_old_log_probs)
+                
+                if ratio.max() > 3.0:
+                    break
+                    
                 surr1 = ratio * batch_advantages
                 surr2 = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range) * batch_advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
@@ -289,11 +293,17 @@ class PPO:
                 nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
                 self.optimizer.step()
 
+                policy_losses.append(policy_loss.item())
+                value_losses.append(value_loss.item())
+                entropies.append(entropy.item())
+
         self.rollout_buffer.clear()
-        return policy_loss.item(), value_loss.item(), entropy.item()
+        return np.mean(policy_losses), np.mean(value_losses), np.mean(entropies)
 
     def learn(self):
         iteration = 0
+        best_reward = -float('inf')
+        
         while self.episode_counter < 1000:
             returns, advantages, avg_ep_reward, num_eps = self.collect_rollouts()
             p_loss, v_loss, ent = self.update_policy(returns, advantages)
@@ -309,6 +319,10 @@ class PPO:
 
             iteration += 1
 
+            if avg_reward > best_reward:
+                best_reward = avg_reward
+                torch.save(self.policy.state_dict(), "best_ppo_model.pth")
+
             self.writer.add_scalar("loss/policy", p_loss, self.episode_counter)
             self.writer.add_scalar("loss/value", v_loss, self.episode_counter)
             self.writer.add_scalar("loss/entropy", ent, self.episode_counter)
@@ -319,10 +333,10 @@ class PPO:
 
             print(f"Ep {self.episode_counter} | AvgReward (this rollout): {avg_ep_reward:.2f} | Trend: {reward_increase:+.2f}")
             print(f"Losses => Policy: {p_loss:.4f}, Value: {v_loss:.4f}, Entropy: {ent:.4f}")
+            print(f"Best Reward: {best_reward:.2f}")
             print("-" * 50)
 
             self.writer.flush()
-            self.scheduler.step()
             current_lr = self.optimizer.param_groups[0]['lr']
             self.writer.add_scalar("charts/learning_rate", current_lr, self.episode_counter)
 
@@ -338,5 +352,15 @@ if __name__ == "__main__":
     discrete_env = DiscretizedCarRacing(base_env)
     env = FrameStackWrapper(discrete_env, k=4)
 
-    agent = PPO(env, writer, n_steps=4096, batch_size=64, n_epochs=10, early_termination=True)
+  
+    agent = PPO(
+        env, 
+        writer, 
+        n_steps=2048,          
+        batch_size=64, 
+        n_epochs=4,             
+        learning_rate=2.5e-4,   
+        entropy_coef=0.01,     
+        early_termination=True
+    )
     agent.learn()
